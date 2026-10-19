@@ -1,0 +1,304 @@
+id: pdb-target-new-structure-release-watch
+namespace: company.team
+
+description: |
+  Weekly watch on the RCSB Protein Data Bank for new experimental structures of the UniProt targets
+  your team works on. One Search API request finds the entries released since the last run, one
+  GraphQL request fetches method, resolution, ligands, deposition group and superseded IDs for all
+  of them, and DuckDB filters by resolution, collapses fragment-screen group depositions and diffs
+  against the IDs already reported before posting the new structures to Slack.
+
+inputs:
+  - id: targets
+    type: ARRAY
+    itemType: STRING
+    displayName: UniProt accessions
+    description: Targets to watch, matched against the UniProt reference of every polymer entity, so complexes where the target is only one chain are included. The defaults are EGFR, KRAS, BRAF, TP53 and SARS-CoV-2 replicase polyprotein 1ab (main protease, macrodomain).
+    defaults:
+      - P00533
+      - P01116
+      - P15056
+      - P04637
+      - P0DTD1
+
+  - id: max_resolution
+    type: FLOAT
+    displayName: Maximum resolution (Angstrom)
+    description: X-ray and cryo-EM entries worse than this are counted in the CSV but not alerted. NMR and other entries without a resolution are always alerted.
+    defaults: 3.5
+
+  - id: lookback_days
+    type: INT
+    displayName: Lookback on the first run (days)
+    description: The BASELINE run reports entries released in this many days. Later runs start from the last release date seen.
+    defaults: 30
+
+  - id: state_key
+    type: STRING
+    displayName: KV state key
+    defaults: pdb_target_structure_watch_state
+
+triggers:
+  - id: weekly_after_pdb_release
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: The PDB publishes its weekly release on Wednesday at 00:00 UTC.
+    cron: "0 6 * * 3"
+
+concurrency:
+  limit: 1
+
+tasks:
+  - id: previous_state
+    type: io.kestra.plugin.core.kv.Get
+    description: Last release date seen and the entry IDs released on that date. Missing on the first (BASELINE) run.
+    key: "{{ inputs.state_key }}"
+    errorOnMissing: false
+
+  - id: window
+    type: io.kestra.plugin.core.output.OutputValues
+    values:
+      since: "{{ outputs.previous_state.value.last_release ?? (now() | dateAdd(-inputs.lookback_days, 'DAYS') | date('yyyy-MM-dd')) }}"
+
+  - id: search
+    type: io.kestra.plugin.core.http.Request
+    description: Search API, entry level, experimental structures only (no computed models). `greater_or_equal` on the last release date plus the stored IDs makes a run safe even if it races the weekly release. HTTP 204 (no body) means no match.
+    uri: https://search.rcsb.org/rcsbsearch/v2/query
+    method: POST
+    contentType: application/json
+    headers:
+      User-Agent: kestra-pdb-target-new-structure-release-watch/1.0 (https://kestra.io)
+    body: |
+      {"query": {"type": "group", "logical_operator": "and", "nodes": [
+        {"type": "terminal", "service": "text", "parameters": {"attribute": "rcsb_polymer_entity_container_identifiers.reference_sequence_identifiers.database_accession", "operator": "in", "value": {{ inputs.targets | toJson }}}},
+        {"type": "terminal", "service": "text", "parameters": {"attribute": "rcsb_accession_info.initial_release_date", "operator": "greater_or_equal", "value": "{{ outputs.window.values.since }}"}}]},
+       "return_type": "entry",
+       "request_options": {"return_all_hits": true, "results_content_type": ["experimental"]}}
+    retry:
+      type: exponential
+      interval: PT30S
+      maxInterval: PT5M
+      maxAttempts: 4
+
+  - id: fetch_entries
+    type: io.kestra.plugin.core.http.Download
+    description: One GraphQL request for all entry IDs found (an empty list returns no entries). Only the fields used are requested.
+    uri: https://data.rcsb.org/graphql
+    method: POST
+    contentType: application/json
+    headers:
+      User-Agent: kestra-pdb-target-new-structure-release-watch/1.0 (https://kestra.io)
+    body: |
+      {"query": "query($ids: [String!]!) { entries(entry_ids: $ids) { rcsb_id struct { title } rcsb_entry_info { experimental_method resolution_combined } rcsb_accession_info { initial_release_date deposit_date } pdbx_deposit_group { group_id group_title } pdbx_database_PDB_obs_spr { replace_pdb_id } polymer_entities { uniprots { rcsb_id rcsb_uniprot_entry_name } } nonpolymer_entities { nonpolymer_comp { chem_comp { id formula_weight } } } rcsb_primary_citation { pdbx_database_id_DOI } } }",
+       "variables": {"ids": {{ (outputs.search.code == 200 ? (outputs.search.body | jq('[.result_set[].identifier]') | first) : []) | toJson }}}}
+    retry:
+      type: exponential
+      interval: PT30S
+      maxInterval: PT5M
+      maxAttempts: 4
+
+  - id: evaluate
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    description: |
+      Flattens the entries, keeps the watched accessions each entry contains, drops entries already reported, applies the
+      resolution cutoff, lists ligands (chemical components of 150 Da or more, minus common crystallisation additives) and
+      collapses entries of the same deposition group (PanDDA fragment screens release dozens at once) into one alert line.
+    url: "jdbc:duckdb:"
+    fetchType: FETCH_ONE
+    inputFiles:
+      entries.json: "{{ outputs.fetch_entries.uri }}"
+      state.json: "{{ (outputs.previous_state.value ?? {}) | toJson }}"
+    outputFiles:
+      - structures_csv
+    parameters:
+      targets: "{{ inputs.targets | join(',') }}"
+      max_res: "{{ inputs.max_resolution }}"
+    sql: |
+      SET TimeZone = 'UTC';
+      CREATE TABLE doc AS SELECT json(content) AS j FROM read_text('entries.json');
+      CREATE TABLE watched AS
+      SELECT DISTINCT upper(trim(t)) AS acc FROM (SELECT unnest(string_split(CAST(:targets AS VARCHAR), ',')) AS t) WHERE trim(t) <> '';
+      CREATE TABLE prev AS
+      SELECT TRY_CAST(json_extract_string(content, '$.last_release') AS DATE) AS last_release,
+             coalesce(from_json(json_extract(content, '$.seen'), '["VARCHAR"]'), CAST([] AS VARCHAR[])) AS seen
+      FROM read_text('state.json');
+
+      CREATE TABLE raw AS
+      SELECT unnest(from_json(coalesce(json_extract(j, '$.data.entries'), '[]'), '["JSON"]')) AS e FROM doc;
+
+      CREATE TABLE entries AS
+      SELECT e->>'$.rcsb_id' AS entry_id,
+             e->>'$.struct.title' AS title,
+             e->>'$.rcsb_entry_info.experimental_method' AS method,
+             round(list_min(from_json(coalesce(e->'$.rcsb_entry_info.resolution_combined', '[]'), '["DOUBLE"]')), 2) AS resolution,
+             CAST(left(e->>'$.rcsb_accession_info.initial_release_date', 10) AS DATE) AS released,
+             CAST(left(e->>'$.rcsb_accession_info.deposit_date', 10) AS DATE) AS deposited,
+             e->>'$.pdbx_deposit_group[0].group_id' AS group_id,
+             e->>'$.pdbx_deposit_group[0].group_title' AS group_title,
+             list_distinct(from_json(coalesce(json_extract(e, '$.polymer_entities[*].uniprots[*]'), '[]'), '[{"rcsb_id":"VARCHAR","rcsb_uniprot_entry_name":["VARCHAR"]}]')) AS uniprots,
+             list_filter(from_json(coalesce(json_extract(e, '$.nonpolymer_entities[*].nonpolymer_comp.chem_comp'), '[]'), '[{"id":"VARCHAR","formula_weight":"DOUBLE"}]'),
+                         c -> c.formula_weight >= 150 AND c.id NOT IN ('PG4', 'PGE', '1PE', 'P6G', 'PE4', 'MES', 'EPE', 'CIT', 'BTB', 'MLI', 'TAR', 'B3P', 'CPS')) AS ligands,
+             from_json(coalesce(json_extract(e, '$.pdbx_database_PDB_obs_spr[*].replace_pdb_id'), '[]'), '["VARCHAR"]') AS supersedes,
+             e->>'$.rcsb_primary_citation.pdbx_database_id_DOI' AS doi
+      FROM raw;
+
+      CREATE TABLE scored AS
+      SELECT entries.*, list_transform(uniprots, u -> u.rcsb_id) AS accessions,
+             array_to_string(list_transform(list_filter(uniprots, u -> list_contains(wl.l, u.rcsb_id)), u -> coalesce(u.rcsb_uniprot_entry_name[1], '') || ' (' || u.rcsb_id || ')'), ', ') AS matched,
+             array_to_string(list_transform(list_filter(uniprots, u -> NOT list_contains(wl.l, u.rcsb_id)), u -> u.rcsb_uniprot_entry_name[1]), ' ') AS partners,
+             NOT list_contains((SELECT seen FROM prev), entry_id) AS is_new,
+             resolution IS NULL OR resolution <= CAST(:max_res AS DOUBLE) AS passes_resolution,
+             array_to_string(list_transform(ligands, c -> c.id), ' ') AS ligand_ids
+      FROM entries, (SELECT list(acc) AS l FROM watched) wl;
+
+      CREATE TABLE alerts AS
+      SELECT coalesce(group_id, entry_id) AS k, count(*) AS n, min(released) AS released, any_value(matched) AS matched,
+             any_value(partners) AS partners, min(resolution) AS best_res, any_value(method) AS method,
+             string_agg(entry_id, ', ' ORDER BY coalesce(resolution, 99)) AS ids, any_value(title) AS title, any_value(group_title) AS group_title,
+             any_value(ligand_ids) AS ligand_ids, any_value(array_to_string(supersedes, ' ')) AS supersedes, any_value(doi) AS doi
+      FROM scored WHERE is_new AND passes_resolution
+      GROUP BY coalesce(group_id, entry_id);
+
+      COPY (SELECT entry_id, released, deposited, method, resolution, matched, partners,
+                   ligand_ids, array_to_string(supersedes, ' ') AS supersedes, group_id, is_new, passes_resolution, doi, title,
+                   'https://www.rcsb.org/structure/' || entry_id AS url
+            FROM scored ORDER BY released DESC, matched, resolution) TO '{{ outputFiles.structures_csv }}' (HEADER, DELIMITER ',');
+
+      SELECT
+        (SELECT last_release FROM prev) IS NULL AS is_baseline,
+        CAST((SELECT max(released) FROM entries) AS VARCHAR) AS latest_release,
+        (SELECT count(*) FROM entries) AS found,
+        (SELECT count(*) FROM scored WHERE is_new) AS new_entries,
+        (SELECT count(*) FROM scored WHERE is_new AND NOT passes_resolution) AS below_cutoff,
+        (SELECT count(*) FROM scored WHERE is_new AND passes_resolution) AS alerted_entries,
+        (SELECT count(*) FROM alerts) AS alert_lines,
+        (SELECT string_agg(w.acc || ' ' || (SELECT count(*) FROM scored s WHERE s.is_new AND list_contains(s.accessions, w.acc)), ', ' ORDER BY w.acc) FROM watched w) AS per_target,
+        coalesce((SELECT string_agg(acc, ', ') FROM watched
+                  WHERE NOT regexp_matches(acc, '^([OPQ][0-9][A-Z0-9]{3}[0-9]|[A-NR-Z][0-9]([A-Z][A-Z0-9]{2}[0-9]){1,2})$')), '') AS invalid_targets,
+        coalesce(json_extract_string((SELECT j FROM doc), '$.errors[0].message'), '') AS graphql_error,
+        coalesce((SELECT string_agg(
+                   CASE WHEN n > 1 THEN '*Group ' || k || '* (' || n || ' entries, ' || method || ', best ' || best_res || ' A) ' || matched || ', released ' || released || ', ' || group_title || '. IDs ' || ids
+                        ELSE '*' || ids || '* ' || matched || ' ' || method || coalesce(' ' || best_res || ' A', '') || ', released ' || released || ', ' || left(title, 140)
+                             || CASE WHEN partners <> '' THEN '. With ' || partners ELSE '' END
+                             || CASE WHEN ligand_ids <> '' THEN '. Ligands ' || ligand_ids ELSE '' END
+                             || CASE WHEN supersedes <> '' THEN '. Supersedes ' || supersedes ELSE '' END
+                             || ' https://www.rcsb.org/structure/' || ids END,
+                   chr(10) ORDER BY matched, released DESC, best_res) FROM alerts), '') AS alert_text,
+        CAST(json_object('last_release', CAST(coalesce((SELECT max(released) FROM entries), (SELECT last_release FROM prev)) AS VARCHAR),
+             'seen', coalesce((SELECT list(entry_id ORDER BY entry_id) FROM entries WHERE released = (SELECT max(released) FROM entries)), (SELECT seen FROM prev))) AS VARCHAR) AS new_state;
+
+  - id: check_response
+    type: io.kestra.plugin.core.execution.Fail
+    description: GraphQL answers HTTP 200 with an `errors` array on a bad query; fail instead of reporting zero structures.
+    runIf: "{{ outputs.evaluate.outputs[0].row.graphql_error is not empty }}"
+    errorMessage: "RCSB GraphQL error: {{ outputs.evaluate.outputs[0].row.graphql_error }}"
+
+  - id: save_state
+    type: io.kestra.plugin.core.kv.Set
+    runIf: "{{ outputs.evaluate.outputs[0].row.latest_release is not null }}"
+    key: "{{ inputs.state_key }}"
+    value: "{{ outputs.evaluate.outputs[0].row.new_state }}"
+    kvType: JSON
+
+  - id: alert
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.evaluate.outputs[0].row.alert_lines > 0 }}"
+    then:
+      - id: log_alert
+        type: io.kestra.plugin.core.log.Log
+        level: WARN
+        message: "{{ outputs.evaluate.outputs[0].row.alerted_entries }} new PDB entries{{ outputs.evaluate.outputs[0].row.is_baseline ? ' (BASELINE run, last ' ~ inputs.lookback_days ~ ' days)' : '' }}:\n{{ outputs.evaluate.outputs[0].row.alert_text }}"
+      - id: slack_alert
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: allowFailure keeps the run green without `SLACK_WEBHOOK_URL`; the alert is still in the WARN log and the CSV.
+        allowFailure: true
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: ":dna: *New PDB structures for watched targets* (since {{ outputs.window.values.since }}, {{ outputs.evaluate.outputs[0].row.below_cutoff }} more above {{ inputs.max_resolution }} A in the CSV)\n{{ outputs.evaluate.outputs[0].row.alert_text }}"
+    else:
+      - id: no_alert
+        type: io.kestra.plugin.core.log.Log
+        message: "No new structures at {{ inputs.max_resolution }} A or better since {{ outputs.window.values.since }}."
+
+  - id: summary
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      Since {{ outputs.window.values.since }}{{ outputs.evaluate.outputs[0].row.is_baseline ? ' (BASELINE)' : '' }}: {{ outputs.evaluate.outputs[0].row.found }} entries found, {{ outputs.evaluate.outputs[0].row.new_entries }} new, {{ outputs.evaluate.outputs[0].row.alerted_entries }} alerted in {{ outputs.evaluate.outputs[0].row.alert_lines }} lines, {{ outputs.evaluate.outputs[0].row.below_cutoff }} above {{ inputs.max_resolution }} A. Latest release {{ outputs.evaluate.outputs[0].row.latest_release ?? 'none' }}.
+      New per target: {{ outputs.evaluate.outputs[0].row.per_target }}{{ outputs.evaluate.outputs[0].row.invalid_targets is empty ? '' : '. Not a valid UniProt accession: ' ~ outputs.evaluate.outputs[0].row.invalid_targets }}
+
+errors:
+  - id: slack_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    allowFailure: true
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: ":x: PDB structure watch {{ flow.id }} failed (execution {{ execution.id }}); this week's release was not checked."
+
+outputs:
+  - id: summary
+    type: JSON
+    value: "{{ outputs.evaluate.outputs[0].row | toJson }}"
+  - id: structures_csv
+    type: FILE
+    value: "{{ outputs.evaluate.outputFiles.structures_csv }}"
+
+extend:
+  title: Weekly Alert on New PDB Structures for Your UniProt Drug Targets (RCSB Search and GraphQL)
+  metaTitle: RCSB PDB New Structure Release Watch for Drug Targets | Kestra
+  shortDescription: Every Wednesday after the PDB weekly release, find new experimental structures of your UniProt targets with one RCSB Search API call, enrich them with one GraphQL call, filter by resolution in DuckDB and post only the entries not reported before to Slack.
+  metaDescription: Weekly RCSB PDB watch for UniProt targets - one Search and one GraphQL call, resolution cutoff, ligands, group depositions collapsed, KV dedupe, Slack alert.
+  description: |
+    Drug discovery teams want to know when a new crystal or cryo-EM structure of one of their targets is released, with its ligand and resolution. The PDB publishes a weekly release every Wednesday at 00:00 UTC; this flow checks it for your UniProt accessions and reports each new entry once.
+
+    ## How it works
+
+    1. A `Schedule` trigger runs Wednesday at 06:00 UTC.
+    2. `previous_state` (KV Get) reads the last release date seen and the IDs released on that date. Missing on the first (BASELINE) run, which looks back `lookback_days` days instead.
+    3. `search` (HTTP Request) makes one RCSB Search API call for experimental entries with a polymer entity mapped to any of the `targets` and an `initial_release_date` on or after the last release date. HTTP 204 means no match.
+    4. `fetch_entries` (HTTP Download) makes one GraphQL call to `data.rcsb.org` for all IDs found, requesting only the fields used.
+    5. `evaluate` (DuckDB) drops IDs already reported, applies `max_resolution` (NMR entries have none and always pass), lists ligands of 150 Da or more minus common additives (PEG, MES, HEPES), names partner proteins in complexes, and collapses a deposition group (PanDDA fragment screens release 15 entries at once) into one line. Targets that are not UniProt accessions (a gene symbol like `EGFR`) are named in the summary.
+    6. `check_response` (Fail) stops when GraphQL returns an `errors` array with HTTP 200. `save_state` (KV Set) stores the new release date and IDs.
+    7. `alert` (If) logs the new structures at WARN and posts them to Slack (`allowFailure: true`). `errors` reports a failed run.
+
+    ## What you get
+
+    - One Slack message per release: entry, target, method, resolution, partners, ligand codes, superseded entry and RCSB link.
+    - A CSV of every entry found (also those over the cutoff or already reported) and a JSON summary with counts per target.
+    - Nothing is reported twice, even when a run races the weekly release.
+
+    ## Who it's for
+
+    - Structural biologists, computational chemists and drug discovery project teams.
+
+    ## Why orchestrate this with Kestra
+
+    - Two HTTP calls and one SQL step replace a notebook someone has to rerun; KV state, retries and the failure alert are declarative.
+
+    ## Prerequisites
+
+    - Kestra 2.0 with the DuckDB and Slack plugins, outbound HTTPS to `search.rcsb.org` and `data.rcsb.org`. No API key.
+
+    ### Secrets
+
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook (optional; alerts stay in the WARN log and the CSV).
+
+    ## Quick start
+
+    1. Execute with the defaults (EGFR, KRAS, BRAF, TP53 and the SARS-CoV-2 replicase). On 19 October 2026 the BASELINE run found 26 entries from the last 30 days: 10 for KRAS, 13 for SARS-CoV-2, 3 for BRAF, 1 for TP53 and none for EGFR; 25 passed the 3.5 A cutoff.
+    2. Execute again: `No new structures at 3.5 A or better since 2026-10-14.`
+    3. Delete the KV key and run with `lookback_days` 50 to see a PanDDA group deposition collapsed into one line.
+    4. Add `SLACK_WEBHOOK_URL` and enable the schedule.
+
+    ## How to extend
+
+    - Add a ForEach that downloads the mmCIF files of new entries to object storage for docking.
+    - Join the ligand codes to your compound registry to spot your own series in public structures.
+
+    ## Links
+
+    - [HTTP Request](https://kestra.io/plugins/core/http/io.kestra.plugin.core.http.request), [HTTP Download](https://kestra.io/plugins/core/http/io.kestra.plugin.core.http.download), [DuckDB Queries](https://kestra.io/plugins/plugin-jdbc-duckdb/io.kestra.plugin.jdbc.duckdb.queries)
+    - [If](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.if), [KV Get](https://kestra.io/plugins/core/kv/io.kestra.plugin.core.kv.get), [KV Set](https://kestra.io/plugins/core/kv/io.kestra.plugin.core.kv.set), [Slack Incoming Webhook](https://kestra.io/plugins/plugin-notifications/slack/io.kestra.plugin.slack.notifications.slackincomingwebhook)
+    - [RCSB Search API](https://search.rcsb.org/), [RCSB Data API (GraphQL)](https://data.rcsb.org/), [RCSB web APIs overview](https://www.rcsb.org/docs/programmatic-access/web-apis-overview)
+  tags:
+    - Data
+  subTags:
+    - Monitoring & Alerting
+  ee: false
+  demo: false
